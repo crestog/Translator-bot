@@ -1,6 +1,6 @@
 """
-Telegram AI Translator Bot - Phase 1
-EN / HI / RU, Qwen3-14B (8-bit), prompt-driven tone modes, English interpretation line.
+Telegram AI Translator Bot - Phase 2 (slice 1)
+Qwen3-14B (8-bit) + CometKiwi quality scoring + plain back-translation + Hinglish/Translit mode.
 """
 import asyncio
 import html as html_lib
@@ -10,6 +10,7 @@ import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from huggingface_hub import login as hf_login
+from comet import download_model, load_from_checkpoint
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -34,10 +35,15 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     quantization_config=BitsAndBytesConfig(load_in_8bit=True),
-    device_map="auto",
+    device_map={"": 0},
     torch_dtype=torch.float16,
 )
-log.info("Model loaded.")
+log.info("Qwen3 loaded on GPU 0.")
+
+log.info("Loading CometKiwi (quality scorer, CPU - keeps it off Qwen3's GPU) ...")
+_qe_path = download_model("Unbabel/wmt22-cometkiwi-da")
+qe_model = load_from_checkpoint(_qe_path)
+log.info("CometKiwi loaded.")
 
 DIRECTIONS = {
     "en_hi": ("English", "Hindi"), "hi_en": ("Hindi", "English"),
@@ -68,6 +74,14 @@ TONE_INSTRUCTIONS = {
         "same here if it fits. If there is a joke or wordplay, prioritize it landing naturally in {tgt} over "
         "literal accuracy."
     ),
+    "hinglish": (
+        "Write the translation using ONLY Roman/Latin alphabet letters, phonetically - the way people type on "
+        "WhatsApp/Instagram when they don't switch keyboards. For Hindi this means Hinglish-style romanization "
+        "(e.g. 'kaise ho' not \u0915\u0948\u0938\u0947 \u0939\u094b); for Russian this means translit-style "
+        "romanization (e.g. 'kak dela' not \u043a\u0430\u043a \u0434\u0435\u043b\u0430). Keep common English "
+        "words in English rather than translating them. Casual tone. Do not use Devanagari or Cyrillic script "
+        "at all. If {tgt} is already English, just translate casually - romanization doesn't apply."
+    ),
     "explain": (
         "Translate naturally, then on a new line starting with 'Note:' briefly explain in English any idiom, "
         "slang, or cultural reference that doesn't map directly."
@@ -75,9 +89,10 @@ TONE_INSTRUCTIONS = {
 }
 TONE_LABELS = {
     "literal": "Literal", "natural": "Natural", "casual": "Casual", "formal": "Formal",
-    "genz": "\U0001F525 Gen-Z/Peer", "explain": "Explain", "all": "\u2705 Select All",
+    "genz": "\U0001F525 Gen-Z/Peer", "hinglish": "\U0001F524 Hinglish/Translit",
+    "explain": "Explain", "all": "\u2705 Select All",
 }
-ALL_TONES_ORDER = ["literal", "natural", "casual", "formal", "genz", "explain"]
+ALL_TONES_ORDER = ["literal", "natural", "casual", "formal", "genz", "hinglish", "explain"]
 
 user_state: dict[int, dict] = {}
 
@@ -96,28 +111,42 @@ def direction_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def tone_keyboard() -> InlineKeyboardMarkup:
-    order = ["literal", "natural", "casual", "formal", "genz", "explain", "all"]
+    order = ["literal", "natural", "casual", "formal", "genz", "hinglish", "explain", "all"]
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=TONE_LABELS[k], callback_data=f"tone:{k}")] for k in order])
 
 def quick_switch_keyboard() -> InlineKeyboardMarkup:
-    order = ["literal", "natural", "casual", "formal", "genz", "explain", "all"]
+    order = ["literal", "natural", "casual", "formal", "genz", "hinglish", "explain", "all"]
     buttons = [InlineKeyboardButton(text=TONE_LABELS[k], callback_data=f"redo:{k}") for k in order]
     return InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 3] for i in range(0, len(buttons), 3)])
 
 def esc(s: str) -> str:
     return html_lib.escape(s, quote=False)
 
-def run_generation(system_prompt: str, user_text: str) -> str:
+def score_candidate(src_text: str, candidate: str) -> float:
+    data = [{"src": src_text, "mt": candidate}]
+    output = qe_model.predict(data, batch_size=1, gpus=0, progress_bar=False)
+    return output.scores[0]
+
+def run_generation(system_prompt: str, user_text: str, temperature: float = 0.7) -> str:
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_text}]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
         output_ids = model.generate(
             **inputs, max_new_tokens=400, do_sample=True,
-            temperature=0.7, top_p=0.8, repetition_penalty=1.05,
+            temperature=temperature, top_p=0.8, repetition_penalty=1.05,
         )
     new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+def generate_and_score_sync(system_prompt: str, user_text: str) -> str:
+    candidates = [
+        run_generation(system_prompt, user_text, temperature=0.7),
+        run_generation(system_prompt, user_text, temperature=0.3),
+    ]
+    scored = [(c, score_candidate(user_text, c)) for c in candidates]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return scored[0][0]
 
 def build_system_prompt(src: str, tgt: str, tone: str) -> str:
     instr = TONE_INSTRUCTIONS[tone].format(
@@ -129,20 +158,16 @@ def build_system_prompt(src: str, tgt: str, tone: str) -> str:
     )
 
 async def translate(text: str, src: str, tgt: str, tone: str) -> str:
-    return await asyncio.to_thread(run_generation, build_system_prompt(src, tgt, tone), text)
+    return await asyncio.to_thread(generate_and_score_sync, build_system_prompt(src, tgt, tone), text)
 
-async def interpret_in_english(translated_text: str, tgt: str, src_is_english: bool) -> str:
-    if src_is_english:
-        instr = (f"The following is a {tgt} translation of an English sentence. In one short English sentence, "
-                  f"describe its tone/register and any nuance a non-native speaker might miss.")
-    else:
-        instr = (f"Translate the following {tgt} text back into plain English, capturing tone and nuance, "
-                  f"so an English speaker understands exactly what it conveys.")
-    return await asyncio.to_thread(run_generation, instr, translated_text)
+async def back_translate_to_english(translated_text: str, tgt: str) -> str:
+    instr = (f"Translate the following {tgt} text into plain, natural English. "
+              f"Output ONLY the English translation - nothing else, no notes, no analysis.")
+    return await asyncio.to_thread(run_generation, instr, translated_text, 0.3)
 
 async def format_single(text: str, src: str, tgt: str, tone: str) -> str:
     translation = await translate(text, src, tgt, tone)
-    interpretation = await interpret_in_english(translation, tgt, src_is_english=(src == "English"))
+    interpretation = await back_translate_to_english(translation, tgt)
     return f"\U0001F3AD <b>{esc(TONE_LABELS[tone])}</b>\n<code>{esc(translation)}</code>\n\U0001F4AC {esc(interpretation)}"
 
 async def format_all(text: str, src: str, tgt: str) -> str:
