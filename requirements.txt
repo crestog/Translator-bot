@@ -1,0 +1,6 @@
+aiogram>=3.15,<4
+transformers>=4.51.0
+accelerate>=0.30
+bitsandbytes>=0.43
+huggingface_hub
+# torch intentionally omitted - Kaggle's GPU image already has a CUDA-matched torch
