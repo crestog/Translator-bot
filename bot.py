@@ -1,6 +1,6 @@
 """
-Telegram AI Translator Bot - Phase 2 (slice 1)
-Qwen3-14B (8-bit) + CometKiwi quality scoring + plain back-translation + Hinglish/Translit mode.
+Telegram AI Translator Bot - Phase 2 (slice 1, revised)
+Qwen3-14B (8-bit) + LLM-as-judge candidate selection + plain back-translation + Hinglish/Translit mode.
 """
 import asyncio
 import html as html_lib
@@ -10,7 +10,6 @@ import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from huggingface_hub import login as hf_login
-from comet import download_model, load_from_checkpoint
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -25,7 +24,7 @@ log = logging.getLogger("translator-bot")
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN not set - add it as a Kaggle Secret.")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN not set.")
 if os.environ.get("HF_TOKEN"):
     hf_login(token=os.environ["HF_TOKEN"])
 
@@ -38,12 +37,7 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map={"": 0},
     torch_dtype=torch.float16,
 )
-log.info("Qwen3 loaded on GPU 0.")
-
-log.info("Loading CometKiwi (quality scorer, CPU - keeps it off Qwen3's GPU) ...")
-_qe_path = download_model("Unbabel/wmt22-cometkiwi-da")
-qe_model = load_from_checkpoint(_qe_path)
-log.info("CometKiwi loaded.")
+log.info("Qwen3 loaded.")
 
 DIRECTIONS = {
     "en_hi": ("English", "Hindi"), "hi_en": ("Hindi", "English"),
@@ -122,11 +116,6 @@ def quick_switch_keyboard() -> InlineKeyboardMarkup:
 def esc(s: str) -> str:
     return html_lib.escape(s, quote=False)
 
-def score_candidate(src_text: str, candidate: str) -> float:
-    data = [{"src": src_text, "mt": candidate}]
-    output = qe_model.predict(data, batch_size=1, gpus=0, progress_bar=False)
-    return output.scores[0]
-
 def run_generation(system_prompt: str, user_text: str, temperature: float = 0.7) -> str:
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_text}]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
@@ -139,14 +128,22 @@ def run_generation(system_prompt: str, user_text: str, temperature: float = 0.7)
     new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-def generate_and_score_sync(system_prompt: str, user_text: str) -> str:
-    candidates = [
-        run_generation(system_prompt, user_text, temperature=0.7),
-        run_generation(system_prompt, user_text, temperature=0.3),
-    ]
-    scored = [(c, score_candidate(user_text, c)) for c in candidates]
-    scored.sort(key=lambda pair: pair[1], reverse=True)
-    return scored[0][0]
+def judge_pick_best(src_text: str, candidate_a: str, candidate_b: str) -> str:
+    if candidate_a.strip() == candidate_b.strip():
+        return candidate_a
+    judge_system = (
+        "You are a strict translation quality judge. Given a source text and two candidate translations, "
+        "reply with ONLY the single letter A or B - whichever candidate is more accurate and natural. "
+        "No explanation, no other text, just the letter."
+    )
+    judge_user = f"Source: {src_text}\n\nCandidate A: {candidate_a}\n\nCandidate B: {candidate_b}"
+    verdict = run_generation(judge_system, judge_user, temperature=0.1)
+    return candidate_b if verdict.strip().upper().startswith("B") else candidate_a
+
+def generate_and_pick_sync(system_prompt: str, user_text: str) -> str:
+    candidate_a = run_generation(system_prompt, user_text, temperature=0.7)
+    candidate_b = run_generation(system_prompt, user_text, temperature=0.3)
+    return judge_pick_best(user_text, candidate_a, candidate_b)
 
 def build_system_prompt(src: str, tgt: str, tone: str) -> str:
     instr = TONE_INSTRUCTIONS[tone].format(
@@ -158,7 +155,7 @@ def build_system_prompt(src: str, tgt: str, tone: str) -> str:
     )
 
 async def translate(text: str, src: str, tgt: str, tone: str) -> str:
-    return await asyncio.to_thread(generate_and_score_sync, build_system_prompt(src, tgt, tone), text)
+    return await asyncio.to_thread(generate_and_pick_sync, build_system_prompt(src, tgt, tone), text)
 
 async def back_translate_to_english(translated_text: str, tgt: str) -> str:
     instr = (f"Translate the following {tgt} text into plain, natural English. "

@@ -3,5 +3,4 @@ transformers>=4.51.0
 accelerate>=0.30
 bitsandbytes>=0.43
 huggingface_hub
-unbabel-comet
 # torch intentionally omitted - Kaggle's GPU image already has a CUDA-matched torch
