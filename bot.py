@@ -1,11 +1,13 @@
 """
 Telegram AI Translator Bot - Phase 2 (slice 1, revised)
-Qwen3-14B (8-bit) + LLM-as-judge candidate selection + plain back-translation + Hinglish/Translit mode.
+Qwen3-14B (8-bit, both GPUs) + LLM-as-judge selection + plain back-translation + Hinglish/Translit mode.
 """
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import asyncio
 import html as html_lib
 import logging
-import os
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -29,15 +31,15 @@ if os.environ.get("HF_TOKEN"):
     hf_login(token=os.environ["HF_TOKEN"])
 
 MODEL_ID = "Qwen/Qwen3-14B"
-log.info("Loading %s ...", MODEL_ID)
+log.info("Loading %s across both GPUs ...", MODEL_ID)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     quantization_config=BitsAndBytesConfig(load_in_8bit=True),
-    device_map={"": 0},
-    torch_dtype=torch.float16,
+    device_map="auto",
+    dtype=torch.float16,
 )
-log.info("Qwen3 loaded.")
+log.info("Qwen3 loaded across %s device(s).", len(set(model.hf_device_map.values())) if hasattr(model, "hf_device_map") else "?")
 
 DIRECTIONS = {
     "en_hi": ("English", "Hindi"), "hi_en": ("Hindi", "English"),
