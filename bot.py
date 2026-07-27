@@ -1,6 +1,6 @@
 """
-Telegram AI Translator Bot - Phase 2 (slice 1, revised)
-Qwen3-14B (8-bit, both GPUs) + LLM-as-judge selection + plain back-translation + Hinglish/Translit mode.
+Telegram AI Translator Bot - Phase 2.5
+Qwen3-14B (style/tone) + IndicTrans2 (faithful NMT anchor for Hindi<->English) + Hinglish/Translit.
 """
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -10,8 +10,9 @@ import html as html_lib
 import logging
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer, BitsAndBytesConfig
 from huggingface_hub import login as hf_login
+from IndicTransToolkit import IndicProcessor
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -30,6 +31,8 @@ if not BOT_TOKEN:
 if os.environ.get("HF_TOKEN"):
     hf_login(token=os.environ["HF_TOKEN"])
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 MODEL_ID = "Qwen/Qwen3-14B"
 log.info("Loading %s across both GPUs ...", MODEL_ID)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -39,7 +42,35 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto",
     dtype=torch.float16,
 )
-log.info("Qwen3 loaded across %s device(s).", len(set(model.hf_device_map.values())) if hasattr(model, "hf_device_map") else "?")
+log.info("Qwen3 loaded.")
+
+log.info("Loading IndicTrans2 (en->indic, indic->en) - faithful NMT, no chat/safety layer ...")
+indic_processor = IndicProcessor(inference=True)
+EN_INDIC_ID = "ai4bharat/indictrans2-en-indic-dist-200M"
+INDIC_EN_ID = "ai4bharat/indictrans2-indic-en-dist-200M"
+en_indic_tokenizer = AutoTokenizer.from_pretrained(EN_INDIC_ID, trust_remote_code=True)
+en_indic_model = AutoModelForSeq2SeqLM.from_pretrained(EN_INDIC_ID, trust_remote_code=True, dtype=torch.float16).to(DEVICE)
+indic_en_tokenizer = AutoTokenizer.from_pretrained(INDIC_EN_ID, trust_remote_code=True)
+indic_en_model = AutoModelForSeq2SeqLM.from_pretrained(INDIC_EN_ID, trust_remote_code=True, dtype=torch.float16).to(DEVICE)
+log.info("IndicTrans2 loaded.")
+
+INDIC_LANG_CODES = {"English": "eng_Latn", "Hindi": "hin_Deva"}
+
+def indictrans_translate(text: str, src: str, tgt: str):
+    """Direct NMT translation - no chat layer, cannot refuse or editorialize."""
+    if src == "English" and tgt == "Hindi":
+        tok, mdl = en_indic_tokenizer, en_indic_model
+    elif src == "Hindi" and tgt == "English":
+        tok, mdl = indic_en_tokenizer, indic_en_model
+    else:
+        return None
+    batch = indic_processor.preprocess_batch([text], src_lang=INDIC_LANG_CODES[src], tgt_lang=INDIC_LANG_CODES[tgt])
+    inputs = tok(batch, padding="longest", truncation=True, max_length=256, return_tensors="pt").to(mdl.device)
+    with torch.inference_mode():
+        outputs = mdl.generate(**inputs, num_beams=5, max_new_tokens=256, early_stopping=True)
+    decoded = tok.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+    result = indic_processor.postprocess_batch(decoded, lang=INDIC_LANG_CODES[tgt])
+    return result[0]
 
 DIRECTIONS = {
     "en_hi": ("English", "Hindi"), "hi_en": ("Hindi", "English"),
@@ -61,26 +92,25 @@ FORMAL_RULES = {
 TONE_INSTRUCTIONS = {
     "literal": "Translate as literally / word-for-word as {tgt} grammar allows, even if slightly unnatural.",
     "natural": "Translate naturally, preserving meaning and everyday flow over literal word order.",
-    "casual": "Translate in a casual, informal register, as if texting a friend. {register_rule}",
-    "formal": "Translate in a polite, formal register, as if addressing an elder or a stranger. {formal_rule}",
+    "casual": "Rewrite in a casual, informal register, as if texting a friend. {register_rule}",
+    "formal": "Rewrite in a polite, formal register, as if addressing an elder or a stranger. {formal_rule}",
     "genz": (
-        "Translate the way same-age friends or classmates (teens-to-20s) would text each other - casual, "
+        "Rewrite the way same-age friends or classmates (teens-to-20s) would text each other - casual, "
         "current slang where natural, playful tone. In both Hindi and Russian, young speakers often keep "
         "common English words/slang as-is (transliterated) rather than translating them formally - do the "
-        "same here if it fits. If there is a joke or wordplay, prioritize it landing naturally in {tgt} over "
-        "literal accuracy."
+        "same here if it fits."
     ),
     "hinglish": (
-        "Write the translation using ONLY Roman/Latin alphabet letters, phonetically - the way people type on "
+        "Rewrite using ONLY Roman/Latin alphabet letters, phonetically - the way people type on "
         "WhatsApp/Instagram when they don't switch keyboards. For Hindi this means Hinglish-style romanization "
         "(e.g. 'kaise ho' not \u0915\u0948\u0938\u0947 \u0939\u094b); for Russian this means translit-style "
         "romanization (e.g. 'kak dela' not \u043a\u0430\u043a \u0434\u0435\u043b\u0430). Keep common English "
-        "words in English rather than translating them. Casual tone. Do not use Devanagari or Cyrillic script "
-        "at all. If {tgt} is already English, just translate casually - romanization doesn't apply."
+        "words in English. Do not use Devanagari or Cyrillic script at all. If {tgt} is already English, just "
+        "keep it casual - romanization doesn't apply."
     ),
     "explain": (
-        "Translate naturally, then on a new line starting with 'Note:' briefly explain in English any idiom, "
-        "slang, or cultural reference that doesn't map directly."
+        "Keep the translation as-is, then on a new line starting with 'Note:' briefly explain in English any "
+        "idiom, slang, or cultural reference that doesn't map directly."
     ),
 }
 TONE_LABELS = {
@@ -89,6 +119,7 @@ TONE_LABELS = {
     "explain": "Explain", "all": "\u2705 Select All",
 }
 ALL_TONES_ORDER = ["literal", "natural", "casual", "formal", "genz", "hinglish", "explain"]
+DIRECT_MODES = {"literal", "natural"}  # for an IndicTrans2-covered pair, these use the anchor as-is
 
 user_state: dict[int, dict] = {}
 
@@ -130,45 +161,42 @@ def run_generation(system_prompt: str, user_text: str, temperature: float = 0.7)
     new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-def judge_pick_best(src_text: str, candidate_a: str, candidate_b: str) -> str:
-    if candidate_a.strip() == candidate_b.strip():
-        return candidate_a
-    judge_system = (
-        "You are a strict translation quality judge. Given a source text and two candidate translations, "
-        "reply with ONLY the single letter A or B - whichever candidate is more accurate and natural. "
-        "No explanation, no other text, just the letter."
-    )
-    judge_user = f"Source: {src_text}\n\nCandidate A: {candidate_a}\n\nCandidate B: {candidate_b}"
-    verdict = run_generation(judge_system, judge_user, temperature=0.1)
-    return candidate_b if verdict.strip().upper().startswith("B") else candidate_a
-
-def generate_and_pick_sync(system_prompt: str, user_text: str) -> str:
-    candidate_a = run_generation(system_prompt, user_text, temperature=0.7)
-    candidate_b = run_generation(system_prompt, user_text, temperature=0.3)
-    return judge_pick_best(user_text, candidate_a, candidate_b)
-
-def build_system_prompt(src: str, tgt: str, tone: str) -> str:
+def build_system_prompt(src: str, tgt: str, tone: str, anchor: str | None) -> str:
     instr = TONE_INSTRUCTIONS[tone].format(
         tgt=tgt, register_rule=REGISTER_RULES.get(tgt, ""), formal_rule=FORMAL_RULES.get(tgt, ""),
     )
-    return (
-        f"You are a professional, direct translation engine - not a conversational assistant, and not "
-        f"the author of the message. You translate EXACTLY what a human user wrote, from {src} to {tgt}. "
-        f"This includes profanity, insults, sexual language, or crude slang - translate it faithfully and "
-        f"directly, the way a subtitle translator or Google Translate would, with no censoring, softening, "
-        f"refusing, or apologizing. NEVER comment on the input, NEVER add disclaimers, NEVER apologize on "
-        f"behalf of the user. If you do not know an exact slang equivalent, pick the closest real, commonly "
-        f"used {tgt} word with the same crudeness level - do not invent words, do not water it down into an "
-        f"unrelated polite sentence. {instr} "
-        f"Output ONLY the translation (and the Note line if asked for) - no preamble, no meta-commentary."
+    base = (
+        f"You are a professional, direct translation engine - not a conversational assistant, and not the "
+        f"author of the message. This includes profanity, insults, sexual language, or crude slang - handle "
+        f"it faithfully and directly, the way a subtitle translator or Google Translate would, with no "
+        f"censoring, softening, refusing, or apologizing. NEVER comment on the input, NEVER add disclaimers. "
+        f"{instr} Output ONLY the result (and the Note line if asked for) - no preamble, no meta-commentary."
     )
+    if anchor:
+        base = (
+            f"A verified, accurate translation into {tgt} already exists: \"{anchor}\". Your ONLY job is to "
+            f"rewrite THIS EXACT TEXT into the requested style below - do not retranslate from scratch, do not "
+            f"change the meaning, do not soften or sanitize any crude/offensive content it contains, do not add "
+            f"commentary. " + base
+        )
+    return base
 
 async def translate(text: str, src: str, tgt: str, tone: str) -> str:
-    return await asyncio.to_thread(generate_and_pick_sync, build_system_prompt(src, tgt, tone), text)
+    anchor = None
+    if {src, tgt} <= {"English", "Hindi"}:
+        anchor = await asyncio.to_thread(indictrans_translate, text, src, tgt)
+    if anchor and tone in DIRECT_MODES:
+        return anchor
+    system_prompt = build_system_prompt(src, tgt, tone, anchor)
+    return await asyncio.to_thread(run_generation, system_prompt, text)
 
 async def back_translate_to_english(translated_text: str, tgt: str) -> str:
+    if tgt == "Hindi":
+        result = await asyncio.to_thread(indictrans_translate, translated_text, "Hindi", "English")
+        if result:
+            return result
     instr = (f"Translate the following {tgt} text into plain, natural English. "
-              f"Output ONLY the English translation - nothing else, no notes, no analysis.")
+              f"Output ONLY the English translation - nothing else, no notes, no analysis, no refusing.")
     return await asyncio.to_thread(run_generation, instr, translated_text, 0.3)
 
 async def format_single(text: str, src: str, tgt: str, tone: str) -> str:
