@@ -152,8 +152,15 @@ def build_system_prompt(src: str, tgt: str, tone: str) -> str:
         tgt=tgt, register_rule=REGISTER_RULES.get(tgt, ""), formal_rule=FORMAL_RULES.get(tgt, ""),
     )
     return (
-        f"You are a precise {src}-to-{tgt} translator. {instr} "
-        f"Output ONLY the translation (and the Note line if asked for) - no preamble."
+        f"You are a professional, direct translation engine - not a conversational assistant, and not "
+        f"the author of the message. You translate EXACTLY what a human user wrote, from {src} to {tgt}. "
+        f"This includes profanity, insults, sexual language, or crude slang - translate it faithfully and "
+        f"directly, the way a subtitle translator or Google Translate would, with no censoring, softening, "
+        f"refusing, or apologizing. NEVER comment on the input, NEVER add disclaimers, NEVER apologize on "
+        f"behalf of the user. If you do not know an exact slang equivalent, pick the closest real, commonly "
+        f"used {tgt} word with the same crudeness level - do not invent words, do not water it down into an "
+        f"unrelated polite sentence. {instr} "
+        f"Output ONLY the translation (and the Note line if asked for) - no preamble, no meta-commentary."
     )
 
 async def translate(text: str, src: str, tgt: str, tone: str) -> str:
